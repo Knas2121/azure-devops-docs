@@ -1,0 +1,583 @@
+var gtTimeInfo = {'fetchStart': 1629906559083, 'fetchEnd': 1629906559105};
+// Copyright (C) Microsoft Corporation. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// This code is used in conjunction with the Google Translate Element script.
+// It is executed in an isolated world of a page to translate it from one
+// language to another.
+// It should be included in the page before the Translate Element script.
+
+// eslint-disable-next-line no-var
+var cr = cr || {};
+
+/**
+ * An object to provide functions to interact with the Translate library.
+ * @type {object}
+ */
+cr.googleTranslate = (function () {
+  /**
+   * Error definitions for |errorCode|. See chrome/common/translate_errors.h
+   * to modify the definition.
+   * @const
+   */
+  const ERROR = {
+    'NONE': 0,
+    'INITIALIZATION_ERROR': 2,
+    'UNSUPPORTED_LANGUAGE': 4,
+    'TRANSLATION_ERROR': 6,
+    'TRANSLATION_TIMEOUT': 7,
+    'UNEXPECTED_SCRIPT_ERROR': 8,
+    'BAD_ORIGIN': 9,
+    'SCRIPT_LOAD_ERROR': 10
+  };
+
+  /**
+   * Result definition for edgeScriptResult.
+   * See component/translate/core/common/edge_translate_script_results.h
+   * @const
+   */
+  const EDGE_SCRIPT_RESULT = {
+    'SUCCESSFUL': 0,
+    'TIMEOUT': 1,
+    'BAD_REQUEST': 2,
+    'SERVICE_UNAVAILABLE': 3,
+    'SERVICE_ERROR': 4,
+    'NETWORK': 5,
+    'UNKNOWN': 6,
+    'SCRIPT_TIMEOUT': 7,
+  };
+
+  /**
+   * Result definition for badRequestError.
+   * See component/translate/core/common/edge_translate_script_results.h
+   * @const
+   */
+  const BAD_REQUEST_ERROR = {
+    'OTHERS': 0,
+    'INVALID_INPUT': 1,
+    'INVALID_CREDENTIALS': 2,
+    'TOO_MANY_REQUESTS': 3,
+  };
+
+  /**
+    * An error code happened in translate.js and the Translate Element library.
+    */
+  let errorCode = ERROR['NONE'];
+
+  /**
+   * The result for translation script run.
+   */
+  let edgeScriptResult = EDGE_SCRIPT_RESULT['SUCCESSFUL'];
+
+  /**
+   * Stores server side languages detected on the page, along with the
+   * percentages of their detection on the page.
+   * e.g. [['en', 0.75], ['fr', 0.25]]
+   */
+  let languageDetectionResults = [];
+
+  /**
+   * The bad request error code.
+   */
+  let badRequestError = BAD_REQUEST_ERROR['OTHERS'];
+
+  /**
+    * A flag representing if the Translate Element has finished a translation.
+    * @type {boolean}
+    */
+  let finished = false;
+
+  /**
+    * Time in msec when this script is injected.
+    * @type {number}
+    */
+  const injectedTime = performance.now();
+
+  /**
+    * Time in msec when the Translate Element library is loaded completely.
+    * @type {number}
+    */
+  const loadedTime = 0.0;
+
+  /**
+    * Time in msec when the Translate Element library is initialized and ready
+    * for performing translation.
+    * @type {number}
+    */
+  const readyTime = 0.0;
+
+  /**
+    * Time in msec when the Translate Element library starts a translation.
+    * @type {number}
+    */
+  let startTime = 0.0;
+
+  /**
+    * Time in msec when the Translate Element library ends a translation.
+    * @type {number}
+    */
+  let endTime = 0.0;
+
+  /**
+   * Count of characters translated so far.
+   * @type {number}
+   */
+  let totalTranslatedCharactersSoFar = 0;
+
+  /**
+   * Count of characters translated due to retries.
+   */
+  let totalCharactersTranslatedByRetry = 0;
+
+  /**
+   * Count of number of translate calls made to bing.
+   */
+  let translateCallCount = 0;
+
+  // map to chrome system language code to the edge translate
+  //
+  const kChromeCodeToEdgeCode = {
+      "zh-CN": "zh-CHS",
+      "zh-TW" : "zh-CHT",
+  };
+
+  // This is needed as some language codes are different between edge translate API
+  // and chrome. So, when the source language is auto detected by API then to map
+  // the detected language code back to chrome language code.
+  const kEdgeCodeToChromeCode = {
+      // translate V2 api language Code
+      "zh-chs": "zh-CN",
+      "zh-cht": "zh-TW",
+
+      // translate V3 api language Code
+      "pt": "pt-BR",
+      "pt-pt": "pt-PT",
+      "sr-Latn": "sr-Latn-RS",
+      "zh-hans": "zh-CN",
+      "zh-hant": "zh-TW",
+  };
+
+  // This is returned when source language is not detected. Empty string
+  // is chosen as value, so that we don't have any merge conflict in translate_helper.
+  const kLanguageNotDetectedCode = '';
+
+  /**
+   * Translation script returns some custom error codes along with standard
+   * HTTP status code.
+   * @const
+   */
+  const SCRIPT_CUSTOM_STATUS_CODE = {
+    'NETWORK_TIMEOUT': -1,
+    'SCRIPT_TIMEOUT': -2,
+  };
+
+  // Functions to classify HTTP response codes to appropriate error buckets.
+  function isBadRequest(errorData) {
+    return errorData.status != null && errorData.status >= 400 && errorData.status < 500;
+  }
+
+  function classifyBadRequestError(statusCode){
+    switch(statusCode){
+      case 400 : return BAD_REQUEST_ERROR['INVALID_INPUT'];
+      case 401 : return BAD_REQUEST_ERROR['INVALID_CREDENTIALS'];
+      case 429 : return BAD_REQUEST_ERROR['TOO_MANY_REQUESTS'];
+      default : return BAD_REQUEST_ERROR['OTHERS'];
+    }
+  }
+
+  function isServiceUnavailable(errorData) {
+      return errorData.status != null && errorData.status === 503;
+  }
+
+  function isServerError(errorData) {
+    return errorData.status != null && errorData.status >= 500 && errorData.status < 600;
+  }
+
+  /**
+  * This will map language code which azure translator understands
+  * @type {string}
+  */
+  function GetEdgeLanguageCode(language) {
+      if (language in kChromeCodeToEdgeCode) {
+          return kChromeCodeToEdgeCode[language];
+      } else {
+          return language;
+      }
+  }
+
+  /**
+  * This will map translate language code to chrome system language code
+  * @type {string}
+  */
+  function GetChromeLanguageCode(language) {
+      if (language in kEdgeCodeToChromeCode) {
+          return kEdgeCodeToChromeCode[language];
+      } else {
+          return language;
+      }
+  }
+
+  function invokeResultCallback() {
+    if (cr.googleTranslate.resultCallback) {
+      cr.googleTranslate.resultCallback();
+      cr.googleTranslate.resultCallback = null;
+    }
+  }
+
+  // Success callback called when the translation is done successfully and
+  // completely by edge.
+  function onSuccessCallback() {
+    finished = true;
+    endTime = performance.now();
+    invokeResultCallback();
+    updateLanguageDetectionResults();
+  }
+
+  // Fetched instances of detected languages, and sorts them with count of instances.
+  // Computes percentage of such instance for each language, and updates
+  // languageDetectionResults with [language, percentage] pairs
+  function updateLanguageDetectionResults() {
+    if (Microsoft.instance && Microsoft.instance.detectedLanguages) {
+        const detectedLangEntries = Object.entries(Microsoft.instance.detectedLanguages);
+        detectedLangEntries.sort(([lang1, count1], [lang2, count2]) => count2 - count1);
+        const totalDetections = detectedLangEntries.reduce(
+            (sum, [lang, count]) => sum + count, 0);
+      if (totalDetections === 0) {
+        languageDetectionResults = [];
+      } else {
+        languageDetectionResults = detectedLangEntries.map(
+          ([lang, count]) => [GetChromeLanguageCode(lang), count / totalDetections * 100]);
+      }
+    }
+  }
+
+  // Callback called when bing api to translate is called.
+  function onTranslateApiCalled(translatedCharactersCount, isRetry) {
+    if (isRetry) {
+      totalCharactersTranslatedByRetry += translatedCharactersCount;
+    }
+    totalTranslatedCharactersSoFar += translatedCharactersCount;
+    translateCallCount++;
+  }
+
+  // Error callback called when the translation results in error by edge.
+  function onErrorCallback(error) {
+    errorCode = ERROR['TRANSLATION_ERROR'];
+    try {
+      const errorData = JSON.parse(error);
+      if (errorData.status === SCRIPT_CUSTOM_STATUS_CODE['SCRIPT_TIMEOUT']) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['SCRIPT_TIMEOUT'];
+      } else if (errorData.status ===  SCRIPT_CUSTOM_STATUS_CODE['NETWORK_TIMEOUT']) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['TIMEOUT'];
+      } else if (isBadRequest(errorData)) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['BAD_REQUEST'];
+        badRequestError = classifyBadRequestError(errorData.status);
+      } else if (isServiceUnavailable(errorData)) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['SERVICE_UNAVAILABLE'];
+      } else if (isServerError(errorData)) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['SERVICE_ERROR'];
+      } else if (errorData.status === 0) {
+        edgeScriptResult = EDGE_SCRIPT_RESULT['NETWORK'];
+      }
+    } catch (e) {
+      edgeScriptResult = EDGE_SCRIPT_RESULT['UNKNOWN'];
+    }
+    finished = false;
+    invokeResultCallback();
+  }
+
+  function translateInternal(
+      originalLang,
+      targetLang,
+      shouldTranslateFullPageInOneGo
+  ) {
+    resetDataBeforeTranslateCall();
+      try {
+          originalLang = GetEdgeLanguageCode(originalLang);
+          targetLang = GetEdgeLanguageCode(targetLang);
+          /**
+           * This will call the startPageTranslation function of edge script
+           */
+          Microsoft.JS.startPageTranslation(
+              originalLang,
+              targetLang,
+              shouldTranslateFullPageInOneGo,
+              "" /*domTranslatorSessionId*/,
+              "" /*token*/,
+              onSuccessCallback,
+              onTranslateApiCalled,
+              onErrorCallback
+          );
+          console.error("edge Translation started");
+      } catch (err) {
+          console.error("Translate: " + err);
+          errorCode = ERROR["UNEXPECTED_SCRIPT_ERROR"];
+          return false;
+      }
+      return true;
+  }
+
+  function resetDataBeforeTranslateCall() {
+    finished = false;
+    errorCode = ERROR["NONE"];
+    startTime = performance.now();
+    totalTranslatedCharactersSoFar = 0;
+    totalCharactersTranslatedByRetry = 0;
+    translateCallCount = 0;
+  }
+
+  // Public API.
+  return {
+
+    /**
+      * Whether the current translate has finished successfully.
+      * @type {boolean}
+      */
+    get finished() {
+      return finished;
+    },
+
+    /**
+      * Whether an error occured initializing the library of translating the
+      * page.
+      * @type {boolean}
+      */
+    get error() {
+      return errorCode !== ERROR['NONE'];
+    },
+
+    /**
+      * Returns a number to represent error type.
+      * @type {number}
+      */
+    get errorCode() {
+      return errorCode;
+    },
+
+   /**
+   * In case of auto detect page language, it returns the language code
+   * determined by translate API.
+   * @type {string}
+   */
+    get sourceLang() {
+        if (Microsoft.instance && Microsoft.instance.detectedLanguage &&
+            errorCode == ERROR['NONE']) {
+            return GetChromeLanguageCode(Microsoft.instance.detectedLanguage);
+        } else {
+            return kLanguageNotDetectedCode;
+        }
+    },
+
+    /**
+     * In case of multiple language detections from server side, in languages
+     * sorted by number of detected instance (descending), this returns language
+     * at the given index.
+     */
+    sourceLangDetectedAt(index) {
+      if (index !== parseInt(index, 10) ||
+          index < 0 ||
+          index >= languageDetectionResults.length) {
+        return '';
+      }
+      return languageDetectionResults[index][0];
+    },
+
+    /**
+     * In case of multiple language detections from server side, in languages
+     * sorted by number of detected instance (descending), this returns percent
+     * at a language at the given index.
+     */
+    sourceLangDetectionPercentAt(index) {
+      if (index !== parseInt(index, 10) ||
+          index < 0 ||
+          index >= languageDetectionResults.length) {
+        return 0.0;
+      }
+      return languageDetectionResults[index][1];
+    },
+
+    /**
+     * Returns result of Edge translation script run.
+     */
+    get edgeScriptResult() {
+      return edgeScriptResult;
+    },
+
+    /**
+     * Returns the client side error status.
+     */
+    get badRequestError() {
+      return badRequestError;
+    },
+
+    /**
+      * Time in msec from this script being injected to all server side scripts
+      * being loaded.
+      * @type {number}
+      */
+    get loadTime() {
+      if (loadedTime === 0) {
+        return 0;
+      }
+      return loadedTime - injectedTime;
+    },
+
+    /**
+      * Time in msec from this script being injected to the Translate Element
+      * library being ready.
+      * @type {number}
+      */
+    get readyTime() {
+      return readyTime - injectedTime;
+    },
+
+    /**
+      * Time in msec to perform translation.
+      * @type {number}
+      */
+    get translationTime() {
+      if (!finished) {
+        return 0;
+      }
+      return endTime - startTime;
+    },
+
+    /**
+     * Characters sent for translation.
+     * @type {number}
+     */
+    get totalTranslatedCharactersSoFar() {
+      return totalTranslatedCharactersSoFar;
+    },
+
+    /**
+     * Characters translated due to retries.
+     * @type {number}
+     */
+    get totalCharactersTranslatedByRetry() {
+      return totalCharactersTranslatedByRetry;
+    },
+
+    /**
+     * Returns count of bing translate calls made.
+     */
+    get translateCallCount() {
+      return translateCallCount;
+    },
+
+    /**
+      * Translate the page contents.  Note that the translation is asynchronous.
+      * You need to regularly check the state of |finished| and |errorCode| to
+      * know if the translation finished or if there was an error.
+      * @param {string} originalLang The language the page is in.
+      * @param {string} targetLang The language the page should be translated to.
+      * @return {boolean} False if the translate library was not ready, in which
+      *                   case the translation is not started.  True otherwise.
+      */
+    translate(originalLang, targetLang) {
+      return translateInternal(
+          originalLang,
+          targetLang,
+          false /*shouldTranslateFullPageInOneGo*/
+      );
+    },
+
+    translateFullPageInOneGo(originalLang, targetLang) {
+      return translateInternal(
+          originalLang,
+          targetLang,
+          true /*shouldTranslateFullPageInOneGo*/
+      );
+    },
+
+    /**
+     * Translates a selected text on a page.
+     * @param {string} targetLang is language in which selected text will get
+     *                            translated into.
+     */
+    translateSelection(targetLang) {
+      resetDataBeforeTranslateCall();
+      try {
+        targetLang = GetEdgeLanguageCode(targetLang);
+        /**
+         * This will call the startSelectionTranslation function of edge script
+         */
+        Microsoft.JS.startSelectionTranslation(
+            targetLang,
+            "" /*domTranslatorSessionId*/,
+            "" /*token*/,
+            onSuccessCallback,
+            onTranslateApiCalled,
+            onErrorCallback
+        );
+      } catch (err) {
+        console.error("Translate Selection: " + err);
+        errorCode = ERROR["UNEXPECTED_SCRIPT_ERROR"];
+        return false;
+      }
+      return true;
+    },
+
+    /**
+      * Reverts the page contents to its original value, effectively reverting
+      * any performed translation.  Does nothing if the page was not translated.
+      */
+    revert() {
+      Microsoft.JS.stopPageTranslation().then(() => {
+        console.error("edge revert page translation.");
+      });
+    },
+
+    /**
+      * Called when an error is caught while executing script fetched in
+      * translate_script.cc.
+      */
+    onTranslateElementError(error) {
+      errorCode = ERROR['UNEXPECTED_SCRIPT_ERROR'];
+    },
+
+    /**
+      * Entry point called by the Translate Element when it want to load an
+      * external CSS resource into the page.
+      * @param {string} url URL of an external CSS resource to load.
+      */
+    onLoadCSS(url) {
+      const element = document.createElement('link');
+      element.type = 'text/css';
+      element.rel = 'stylesheet';
+      element.charset = 'UTF-8';
+      element.href = url;
+      document.head.appendChild(element);
+    },
+
+    /**
+      * Entry point called by the Translate Element when it want to load and run
+      * an external JavaScript on the page.
+      * @param {string} url URL of an external JavaScript to load.
+      */
+    onLoadJavascript(url) {
+      // securityOrigin is predefined by translate_script.cc.
+      if (!url.startsWith(securityOrigin)) {
+        console.error('Translate: ' + url + ' is not allowed to load.');
+        errorCode = ERROR['BAD_ORIGIN'];
+        return;
+      }
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.onreadystatechange = function() {
+        if (this.readyState !== this.DONE) {
+          return;
+        }
+        if (this.status !== 200) {
+          errorCode = ERROR['SCRIPT_LOAD_ERROR'];
+          return;
+        }
+        eval(this.responseText);
+      };
+      xhr.send();
+    }
+};
+})();
+try {  function typeOf(n){var t=typeof n;return t==="object"&&(n?Object.prototype.toString.call(n)=="[object Array]"&&(t="array"):t="null"),t}function getUiTextLang(){return Microsoft.JS.TextLanguage.normalizeCode(window.navigator.language)||"en"}var DomUtils,IframeUtils,TranslatorConstants,Logger,DomTranslationUtils,VisibilityUtils,Microsoft;(function(n){function t(n,t,i){var r=function(r){return t(n,i,r)};return n.addEventListener("scroll",r,!0),r}function i(n,t){n.removeEventListener("scroll",t,!0)}function r(n,t){var i=window.getComputedStyle(n);return i?(t=t.replace(/([A-Z])/g,"-$1").toLowerCase(),i[t]||""):""}function u(n){return encodeURIComponent(n).replace(/%\w\w/g," ").length}function f(n){var t=n._display=n._display||this.getStyleValue(n,"display"),i=n._position=n._position||this.getStyleValue(n,"position");return t&&t.toLowerCase()=="inline"&&i.toLowerCase()=="static"&&n.parentNode&&n.parentNode.nodeType==1?this.getBlockParent(n.parentNode):n}function e(n,t,i){return(!i||i.isCompleted)&&(i={timeout:null,isCompleted:!1}),i.timeout!==null&&clearTimeout(i.timeout),i.timeout=setTimeout(function(){typeof n=="function"&&n();i.completed=!0},t),i}function o(n){var t=n.innerHTML;return t?t.length:0}function s(n,t){try{return n.getAttribute(t)||n[t]}catch(i){return null}}function h(t){if(t&&Object.prototype.toString.call(t)==="[object Function]"){var i,f=function(r){return n.addScrollEvent(r,function(){r.clearTimeout(i);i=setTimeout(function(){t()},66)})},r=window,u=IframeUtils.getReadingViewIFrameWindow();return u&&(r=u),f(r)}}n.addScrollEvent=t;n.removeScrollEvent=i;n.getStyleValue=r;n.getStringByteCount=u;n.getBlockParent=f;n.deferTask=e;n.getInnerHtmlLength=o;n.getAttributeValue=s;n.scrollStop=h})(DomUtils||(DomUtils={})),function(n){function i(n){try{for(var r=0,i=n.contentWindow;i!=top;)r++,i=i.parent;return r}catch(u){return t+1}}function r(n){try{return n.contentWindow&&n.contentWindow.document&&n.contentWindow.document.documentElement&&n.contentWindow.document.body&&i(n)<=t}catch(r){}return!1}function u(n){try{return n.contentWindow&&n.contentWindow.document}catch(t){}return!1}function f(){var t,n;try{t=new URL(window.location.href)}catch(i){return null}return t.protocol==="read:"&&(n=document.getElementById("__rv_dataSource"),n)?n.contentWindow:null}var t=10;n.getIframeNodeDepth=i;n.isFrame=r;n.isIframeElement=u;n.getReadingViewIFrameWindow=f}(IframeUtils||(IframeUtils={})),function(n){n.UntranslatableElements=Object.freeze({head:1,script:1,style:1,code:1,samp:1,"var":1,kbd:1,pre:1,object:1,address:1,noscript:1,embed:1,map:1});n.OnlyAttributesTranslatableElement=Object.freeze({textarea:1});n.TranslateMode=Object.freeze({Inherit:0,On:1,Off:2,Skip:3});n.TerminalElements=Object.freeze(Object.assign({hr:1,input:1,title:1,br:1,frame:1,iframe:1,textarea:1},n.UntranslatableElements));n.MsNoTranslateClass="msnotranslate";var t=()=>!0;n.TranslatableAttributes=Object.freeze({INPUT:[{predicate:n=>["button","submit","reset"].includes(n===null||n===void 0?void 0:n.type),attributes:["value"]},{predicate:n=>["image"].includes(n===null||n===void 0?void 0:n.type),attributes:["alt"]},{predicate:t,attributes:["placeholder"]},],TEXTAREA:[{predicate:t,attributes:["placeholder"]},],IMG:[{predicate:t,attributes:["alt"]},],AREA:[{predicate:t,attributes:["alt"]},],OPTION:[{predicate:t,attributes:["label"]},],OPTGROUP:[{predicate:t,attributes:["label"]},],TRACK:[{predicate:t,attributes:["label"]},]});n.TranslationAttributes=Object.freeze({translate:{"true":n.TranslateMode.On,yes:n.TranslateMode.On,"false":n.TranslateMode.Off,no:n.TranslateMode.Off,skip:n.TranslateMode.Skip}});n.TranslationClassNames={notranslate:n.TranslateMode.Off,skiptranslate:n.TranslateMode.Skip};n.TranslationClassNames[n.MsNoTranslateClass]=n.TranslateMode.Off;Object.freeze(n.TranslationClassNames);n.HiddenElementMarker="_mstHidden";n.HiddenAttributeMarker="_mstHiddenAttr";n.VisibleElementMarker="_mstVisible";n.MstAttributes=Object.freeze(["_mstTextHash","_msthash",n.HiddenElementMarker,n.HiddenAttributeMarker,n.VisibleElementMarker,...new Set(Object.values(n.TranslatableAttributes).flat().map(n=>n.attributes).flat().map(n=>"_mst"+n))]);n.VisibilityAttributes=Object.freeze(["style","class"]);n.MaxDepthToCheck=9;let i;(function(n){n[n.Auto=0]="Auto";n[n.Scrolled=1]="Scrolled";n[n.Mutation=2]="Mutation";n[n.VisibilityChange=3]="VisibilityChange"})(i=n.TranslationTrigger||(n.TranslationTrigger={}));n.TranslationTimeoutMs=2e4;n.NetworkTimeoutStatusCode=-1;n.ScriptTimeoutStatusCode=-2}(TranslatorConstants||(TranslatorConstants={}));String.isNullOrWhiteSpace=String.isNullOrWhiteSpace||function(n){return n===undefined||n===null||typeof n!="string"||n.trim().length===0};String.htmlEscape=String.htmlEscape||function(n){if(!n)return"";var t=document.createElement("span");return t.innerText=n,t.innerHTML};Logger=function(){"use strict";return{info:function(...n){console&&typeOf(console.info)==="function"&&Microsoft.JS.config.logLevel&Microsoft.JS.LogLevel.Info&&console.info.apply(console,n)},warning:function(...n){console&&typeOf(console.warn)==="function"&&Microsoft.JS.config.logLevel&Microsoft.JS.LogLevel.Warning&&console.warn.apply(console,n)},error:function(...n){console&&typeOf(console.error)==="function"&&Microsoft.JS.config.logLevel&Microsoft.JS.LogLevel.Error&&console.error.apply(console,n)},assert:function(n,...t){console&&typeOf(console.assert)==="function"&&Microsoft.JS.config.logLevel&Microsoft.JS.LogLevel.Debug&&(t.unshift(n),console.assert.apply(console,t))},debug:function(...n){typeOf(console.debug)==="function"&&Microsoft.JS.config.logLevel&Microsoft.JS.LogLevel.Debug&&console.debug.apply(console,n)}}}(),function(n){var t;(function(t){"use strict";function h(n){switch(typeOf(n)){case"object":return JSON.stringify(n);case"null":return"null";case"undefined":return"undefined";case"array":return JSON.stringify(n);default:return n.toString()}}function e(n){var i="",r=0,t;if(n)for(t in n)n.hasOwnProperty(t)&&(r++&&(i+="&"),i+=encodeURIComponent(t),n[t]!=null&&(i+="="+encodeURIComponent(n[t])));return i}function l(n,t,i,u){var o,f;if(u.query&&(o=e(u.query),o.length>0&&(t+=(t.indexOf("?")<0?"?":"&")+o)),typeOf(u.timeoutInMs)==="number"&&(n.timeout=u.timeoutInMs),n.open(r[i],t,!0),u.headers)for(f in u.headers)u.headers.hasOwnProperty(f)&&n.setRequestHeader(f,u.headers[f]);u.contentType&&n.setRequestHeader("Content-Type",u.contentType)}function a(n,t,u){if(u=u||{},n==null||t==null)return Promise.reject(new i("HTTP method or URL are not set"));if(u.timeoutInMs!=null&&u.timeoutInMs<0)return Promise.reject(new i("Cannot have a negative timeout. Set to 0 to have no timeout"));return new Promise(function(f,e){var o=new XMLHttpRequest,s;l(o,t,n,u);s=null;n!=r.GET&&n!=r.HEAD&&(s=u.body);o.send(s);o.onload=function(){if(o.status>=200&&o.status<300){var n=o.response;if(u.parser)try{n=u.parser(o)}catch(t){e(t);return}f(n)}else e(new i(o.statusText,o.status,o))};o.onerror=function(){var n=o.statusText||"Failed to send the request";e(new i(n,o.status,o))};o.ontimeout=function(){e(new i("Timed out",TranslatorConstants.NetworkTimeoutStatusCode,o))};u.token&&u.token.addListener&&u.token.addListener(o.abort.bind(o))})}function v(n,t,i,r,e,o,s,h){function c(){clearTimeout(u)}function l(n){c();f().then(()=>{h(n)})}clearTimeout(u);i||(u=window.setTimeout(()=>{Logger.error(TranslatorConstants.TranslationTimeoutMs+"ms completed now. Translation timed out."),l(JSON.stringify({status:TranslatorConstants.ScriptTimeoutStatusCode}))},TranslatorConstants.TranslationTimeoutMs));Logger.info("Beginning page translation...");f().then(()=>y(n,t,i,e,()=>{c(),o()},s,n=>{c(),h(n)})).catch(n=>{Logger.error("Failed to translate page."),l(n)})}function y(t,i,r,u,f,e,o){var s=f?n=>{Logger.debug("Intermidiate complete called with "+n),f()}:null,h=t=>{Logger.error("Error occurred while translating. Details: "+t),n.instance=null,typeof o=="function"&&o(t)};return n.JS.config.translatorClient.sessionTokenCookie=u,n.Translator.translationStartTime=performance.now(),new Promise(function(u){n.instance=new n.DomTranslator(document.body,t,i,()=>{u()},h,3e5,!1,r,s,e)}).then(function(){Logger.info("Successfully completed translation.")}).catch(function(n){Logger.error("Failed to translate the page",n);o&&o(n)})}function f(){return n.instance===undefined||n.instance===null?Promise.resolve():new Promise(t=>{n.instance.cancel(),n.instance=null,Logger.info("Successfully completed untranslation."),t()})}function o(n){var r=n.getSelection(),t,f=n.document.activeElement;if(f&&f.nodeType===1&&f.nodeName==="A"&&!r.containsNode(f,!0))return t=n.document.createRange(),t.selectNode(f),r.removeAllRanges(),r.addRange(t),f;if(r.isCollapsed||r.rangeCount<1)return null;t=r.getRangeAt(0);var u=t.startContainer,i=t.endContainer,e=t.startOffset,o=t.endOffset;return u.nodeType===3&&e!==0&&(u.parentNode.insertBefore(document.createTextNode(u.nodeValue.substring(0,e)),u),u.nodeValue=u.nodeValue.substring(e),t.setStart(u,0),u===i&&(o-=e)),i.nodeType===3&&o!==i.nodeValue.length&&(i.parentNode.insertBefore(document.createTextNode(i.nodeValue.substring(o)),i.nextSibling),i.nodeValue=i.nodeValue.substring(0,o),t.setEnd(i,i.nodeValue.length)),r.removeAllRanges(),r.addRange(t),t.commonAncestorContainer.nodeType===3?t.commonAncestorContainer.parentNode:t.commonAncestorContainer}function p(t,i,r,u,f,e){function y(i,r){return new Promise(function(i,e){n.instance=new n.DomTranslator(r,"",t,function(n){i(n)},function(n){v(n);e(n)},3e5,!0,!1,u,f)})}var c,h,a,v,l,s;for(n.JS.config.translatorClient.sessionTokenCookie=r,n.Translator.translationStartTime=performance.now(),c=[],h=o(window),h&&c.push(h),a=document.querySelectorAll("iframe"),s=0;s<a.length;s++)try{h=o(a[s].contentWindow);h&&c.push(h)}catch(p){}for(v=t=>{Logger.error("Error occurred while translating selection. Details: "+t),n.instance=null,typeof e=="function"&&e(t)},l=Promise.resolve(null),s=0;s<c.length;s++)l=l.then(y.bind(null,null,c[s]));return l.catch(function(n){Logger.error("Failed to translate the text selection(s)",n);v(n);Promise.reject(n)})}function b(n,t){var i,r,u,f;if(n&&t&&t.length){for(i=new w,r=0,i.push(0);r<t.length&&i.length&&n;)u=t.indexOf(n),u>=0?(f=t[r],t[r]=t[u],t[u]=f,r++,n=n.parentNode,i.pop()):i.top<n.childNodes.length?(n=n.childNodes[i.top],i.top++,i.push(0)):(n=n.parentNode,i.pop());while(r<t.length)t.pop()}}let s;(function(n){n[n.Off=0]="Off";n[n.Error=1]="Error";n[n.Warning=2]="Warning";n[n.Info=4]="Info";n[n.Debug=8]="Debug";n[n.Assert=16]="Assert";n[n.All=4294967295]="All"})(s=t.LogLevel||(t.LogLevel={}));var u=null;t.serialize=h;class c{constructor(n){this._listeners=[];this._canceled=!1;typeof n=="number"&&n>0&&setTimeout(()=>{this.cancel()},n)}get isCanceled(){return this._canceled}throwIfCanceled(){if(this._canceled===!0)throw new Error("Operation was canceled");}addListener(n){typeOf(n)==="function"&&(this._listeners.push(n),this._canceled&&setTimeout(n,0))}cancel(){if(this._canceled!==!0){this._canceled=!0;for(var n=0;n<this._listeners.length;n++)try{this._listeners[n]()}catch(t){Logger.warning("Failed during cancellation callback",t)}}}}t.CancellationTokenSource=c;let r;(function(n){n[n.GET=0]="GET";n[n.POST=1]="POST";n[n.HEAD=2]="HEAD";n[n.PUT=3]="PUT";n[n.DELETE=4]="DELETE"})(r=t.HttpMethod||(t.HttpMethod={}));class i{constructor(n,t=0,i=null){this.message=n;this.status=t;this.details=i}get isHttpError(){return!0}get isBadRequest(){return this.status!=null&&this.status>=400&&this.status<500}get isServerError(){return this.status!=null&&this.status>=500&&this.status<600}get isServiceUnavailable(){return this.status===503}get isOverQuota(){return this.status===429}}t.HttpError=i;t.toQueryString=e;t.AjaxPromise=a;t.startPageTranslation=v;t.stopPageTranslation=f;t.startSelectionTranslation=p;class w extends Array{get top(){return this[this.length-1]}set top(n){this[this.length-1]=n}}t.orderByDomOrder=b})(t=n.JS||(n.JS={}))}(Microsoft||(Microsoft={})),function(n){var t;(function(n){"use strict";function a(){if(e==null||o==0)return!1;var n=(new Date).getTime(),t=(n-o)/l;return Math.round(t)<=c?!0:!1}function t(t,i){var r;try{r=JSON.parse(t.responseText)}catch(u){throw new n.HttpError(t.responseText);}if(typeOf(r)!==i)throw new n.HttpError(n.serialize(r));return r}function s(n){if(String.isNullOrWhiteSpace(n))return null;var t=n.split("; ").map(function(n){return n.split("=")});return t.length>=2&&t[0]&&!String.isNullOrWhiteSpace(t[0][1])&&t[1]&&t[1][0]==="expires"&&new Date<=new Date(t[1][1])?{"X-API-Session":decodeURI(t[0][1])}:null}const h={ar:!0,fa:!0,he:!0,ku:!0,ps:!0,ur:!0};let e=null,o=0;const c=8,l=6e4;class r{constructor(n,t){this.name=t;this.code=r.normalizeCode(n)}toString(){return`${this.code}: ${this.name}`}static isRtl(n){return n=r.normalizeCode(n),n&&h.hasOwnProperty(n.toLowerCase())}static equals(n,t){return n!=null&&t!=null&&n.code===t.code}static normalizeCode(n){var r="",f="",u="",t,i,e;if(typeOf(n)==="string")for(t=n.split("-"),r=t[0].toLowerCase(),i=1;i<t.length&&!u&&!f;i++)t[i].length===2?(f=t[i].toUpperCase(),r==="zh"&&f==="CN"?u="Hans":r=="zh"&&f==="TW"&&(u="Hant")):t[i].length!==3||f?t[i].length!==4||f||(u=t[i][0].toUpperCase()+t[i].substring(1).toLowerCase()):t[i].toUpperCase()==="CHS"?u="Hans":t[i]==="CHT"&&(u="Hant");return r==="nb"?r="no":r==="und"&&(r=""),e=r,u&&(e+="-"+u),e}}n.TextLanguage=r;class u{constructor(t,i){var r,u;if(this._baseUrl=t,this._ref=i,t==null||t.length===0)throw new Error("The application ID cannot be null or empty");this._baseQuery="";r=t.indexOf("?");r>=0&&(this._baseUrl=t.substring(0,r),this._baseQuery=t.substring(r));this._baseUrl.charAt(this._baseUrl.length-1)!=="/"&&(this._baseUrl+="/");u=n.toQueryString({ref:i});this._baseQuery+=(this._baseQuery.length===0?"?":"&")+u}getTextLanguagesAsync(i){return n.AjaxPromise(n.HttpMethod.GET,this._baseUrl+"languages/text"+this._baseQuery,{parser:function(n){return t(n,"object")},headers:s(this.sessionTokenCookie),token:i}).then(n=>{var i=[];for(var t in n)n.hasOwnProperty(t)&&i.push(new r(t,n[t]));return i})}translateAsync(i,r,u,f,e,o){if(r==null||r.length===0)return Promise.reject(new n.HttpError("toLang cannot be null or empty"));if(u==null)return Promise.reject(new n.HttpError("Must specify an array of text items to translate"));var h={from:i||"",to:r};return f&&(h.options=JSON.stringify(f)),n.AjaxPromise(n.HttpMethod.POST,this._baseUrl+"translate"+this._baseQuery,{query:h,contentType:"application/json",body:JSON.stringify(u),timeoutInMs:e,headers:s(this.sessionTokenCookie),parser:function(n){for(var i=t(n,"object"),u=[],r=0;i.items&&r<i.items.length;r++)u.push({From:i.from,TranslatedText:i.items[r].text,OriginalTextSentenceLengths:i.items[r].originalSentenceLengths,TranslatedTextSentenceLengths:i.items[r].translatedSentenceLengths});return u},token:o})}}u.TEXT_CONTENT="text/plain";u.XML_CONTENT="text/xml";u.HTML_CONTENT="text/html";n.AjaxTranslatorClientV2=u;class f{constructor(t,i,r,u){var f,e;if(this.languageUrl=t,this.translationUrl=i,this._ref=r,t==null||t.length===0||i===null||i===undefined||i.length===0)throw new Error("The base URL can not be empty");if(!u||u.length===0)throw new Error("App id can not be null");this._baseQuery="";f=t.indexOf("?");f>=0&&(this.languageUrl=t.substring(0,f),this._baseQuery=t.substring(f));this.languageUrl.charAt(this.languageUrl.length-1)!=="/"&&(this.languageUrl+="/");e=n.toQueryString({ref:r});this._baseQuery+=(this._baseQuery.length===0?"?":"&")+e;this._translationUrl=i;this._appId=u}getTextLanguagesAsync(i){return n.AjaxPromise(n.HttpMethod.GET,this._langaugeUrl+"languages/text"+this._baseQuery,{parser:function(n){return t(n,"object")},headers:s(this.sessionTokenCookie),token:i}).then(n=>{var i=[];for(var t in n)n.hasOwnProperty(t)&&i.push(new r(t,n[t]));return i})}translateAsync(i,r,u,f,e,o){var s,h;if(r==null||r.length===0)return Promise.reject(new n.HttpError("toLang cannot be null or empty"));if(u==null)return Promise.reject(new n.HttpError("Must specify an array of text items to translate"));for(s=0;s<u.length;s++);return h={from:i||"",to:r,appId:this._appId,texts:JSON.stringify(u)},f&&(h.options=JSON.stringify(f)),n.AjaxPromise(n.HttpMethod.GET,this.translationUrl,{query:h,timeoutInMs:e,parser:function(n){for(var i=t(n,"array"),u=[],r=0;i.length&&r<i.length;r++)u.push(i[r]);return u},token:o})}}f.TEXT_CONTENT="text/plain";f.XML_CONTENT="text/xml";f.HTML_CONTENT="text/html";n.AjaxS2STranslatorClientV2=f;class i{constructor(n,t){if(this.authorizationUrl=n,this.translationUrl=t,n==null||n.length===0||t===null||t===undefined||t.length===0)throw new Error("The URL can not be empty");this._authorizationUrl=n;this._translationUrl=t}getAuthorizationTokenAsync(){return a()?Promise.resolve(e):(o=(new Date).getTime(),n.AjaxPromise(n.HttpMethod.GET,this.authorizationUrl,{}))}getTextLanguagesAsync(){return null}asyncFetchHelper(i,r,u,f,o,s,h,c,l){var a,v,y,p,w;if(r==null||r.length===0)return Promise.reject(new n.HttpError("toLang cannot be null or empty"));if(u==null)return Promise.reject(new n.HttpError("Must specify an array of text items to translate"));for(e=f,a={from:i||"",to:r},a["api-version"]="3.0",a.includeSentenceLength="true",o&&(a.options=JSON.stringify(o)),y=0,p=[],v=0;v<u.length;++v)p.push({Text:u[v]}),y+=u[v].length;return c(y,l),w="Bearer "+f,n.AjaxPromise(n.HttpMethod.POST,this.translationUrl,{query:a,contentType:"application/json",body:JSON.stringify(p),headers:{Authorization:w},parser:function(n){for(var r=t(n,"array"),f=[],u=0;r.length&&u<r.length;u++)f.push({From:i||r[u].detectedLanguage.language,TranslatedText:r[u].translations[0].text,OriginalTextSentenceLengths:r[u].translations[0].hasOwnProperty("sentLen")?r[u].translations[0].sentLen.srcSentLen:0,TranslatedTextSentenceLengths:r[u].translations[0].hasOwnProperty("sentLen")?r[u].translations[0].sentLen.transSentLen:0});return f},token:h})}translateAsync(n,t,r,u,f,e,o){return this.getAuthorizationTokenAsync().then(s=>this.translateAsyncHelper(n,t,r,s,i.NETWORK_ATTEMPTS,u,f,e,o,!1)).catch(n=>Promise.reject(n))}translateAsyncHelper(n,t,i,r,u,f,e,o,s,h){return this.asyncFetchHelper(n,t,i,r,f,e,o,s,h).then(n=>n).catch(h=>u===1||h.status!==0?Promise.reject(h):this.translateAsyncHelper(n,t,i,r,u-1,f,e,o,s,!0))}}i.NETWORK_ATTEMPTS=5;i.TEXT_CONTENT="text/plain";i.XML_CONTENT="text/xml";i.HTML_CONTENT="text/html";n.AjaxEdgeTranslatorClientV3=i;class v{constructor(n){if(this.translationUrl=n,n===null||n===undefined||n.length===0)throw new Error("The URL can not be empty");this._translationUrl=n}getTextLanguagesAsync(){return null}translateAsync(i,r,u,f,e,o,s){var h,c;return r==null||r.length===0?Promise.reject(new n.HttpError("toLang cannot be null or empty")):u==null?Promise.reject(new n.HttpError("Must specify an array of text items to translate")):(h={from:i||"",to:r},h["api-version"]="3.0",h.includeSentenceLength="true",f&&(h.options=JSON.stringify(f)),c=0,u.forEach(n=>{c+=n.length}),s(c,!1),n.AjaxPromise(n.HttpMethod.POST,this.translationUrl,{query:h,contentType:"application/json",body:JSON.stringify(u),parser:function(n){for(var r=t(n,"array"),f=[],u=0;r.length&&u<r.length;u++)f.push({From:i||r[u].detectedLanguage.language,TranslatedText:r[u].translations[0].text,OriginalTextSentenceLengths:r[u].translations[0].hasOwnProperty("sentLen")?r[u].translations[0].sentLen.srcSentLen:0,TranslatedTextSentenceLengths:r[u].translations[0].hasOwnProperty("sentLen")?r[u].translations[0].sentLen.transSentLen:0});return f},token:o}))}}n.AjaxEdgeTranslatorAPIClient=v;class y{getAuthorizationTokenAsync(){return Promise.resolve("null")}getTextLanguagesAsync(){return null}translateAsync(t,i,r,u,f,e,o){var c,h,s,l;if(i==null||i.length===0)return Promise.reject(new n.HttpError("toLang cannot be null or empty"));if(r==null)return Promise.reject(new n.HttpError("Must specify an array of text items to translate"));t==""&&(t=i);c=0;r.forEach(n=>{c+=n.length});o(c,!1);h=[];for(s of r)window.mockApiMap[s]&&window.mockApiMap[s][i]?(l=window.mockApiMap[s][i],h.push({TranslatedText:l,From:t,OriginalTextSentenceLengths:s.split(".").map(n=>n.length),TranslatedTextSentenceLengths:l.split(".").map(n=>n.length)})):(Logger.error("Could not translate: "+s+" from "+t+" to "+i),h.push({From:t,Error:"MockAPI does not has a translation for "+s+" to convert in "+i,OriginalTextSentenceLengths:s.split(".").map(n=>n.length),TranslatedTextSentenceLengths:[0],TranslatedText:null}));return Promise.resolve(h)}}n.TranslateTestClient=y})(t=n.JS||(n.JS={}))}(Microsoft||(Microsoft={})),function(n){function e(n){var f,t,i,r,u;if(!n||typeof n.nodeName!="string")return[];for(f=new Set,i=TranslatorConstants.TranslatableAttributes[n.nodeName],r=0;i&&r<i.length;r++)if(i[r].predicate(n)===!0)for(u=0;u<i[r].attributes.length;u++)t=n.getAttribute(i[r].attributes[u]),typeof t=="string"&&t.length>0&&t.trim().length>0&&f.add(i[r].attributes[u]);return n.nodeType===1&&n.hasAttribute("aria-label")&&(t=n.getAttribute("aria-label"),typeof t=="string"&&t.length>0&&f.add("aria-label")),[...f]}function nt(n){if(n.nodeType==3)return!0;if(n.nodeType!=1)return!1;if(IframeUtils.isFrame(n))return!0;if(!n.hasChildNodes()&&!TranslatorConstants.TranslatableAttributes.hasOwnProperty(n.nodeName)||TranslatorConstants.UntranslatableElements[n.nodeName.toLowerCase()])return!1;var i;try{i=t(n)}catch(r){}return i==TranslatorConstants.TranslateMode.Off||i==TranslatorConstants.TranslateMode.Skip?!1:st(n,5)}function t(n){var t=TranslatorConstants.TranslateMode.Inherit,u,f,s,e,o,r,h,i;if(!n.getAttribute)return t;for(u in TranslatorConstants.TranslationAttributes)if(f=DomUtils.getAttributeValue(n,u),f!=null&&(s=TranslatorConstants.TranslationAttributes[u],i=s[f.toString().toLowerCase()],t=i||t,t==TranslatorConstants.TranslateMode.Off||t==TranslatorConstants.TranslateMode.Skip))return t;if(e=DomUtils.getAttributeValue(n,"class")||DomUtils.getAttributeValue(n,"className"),e!=null)for(o=e.toString().split(" "),r=0;r<o.length;r++)if(h=o[r],i=TranslatorConstants.TranslationClassNames[h.toLowerCase()],t=i||t,t==TranslatorConstants.TranslateMode.Off)return t;return t}function o(n){var t=new RegExp("[a-zA-Z0-9\\?!"+String.fromCodePoint(191)+String.fromCodePoint(161)+".,:\\|"+String.fromCodePoint(192)+"-"+String.fromCodePoint(65535)+"]");return t.test(n)}function tt(){return document.getElementsByClassName(TranslatorConstants.MsNoTranslateClass)}function s(n){if(n.nodeType==3||n.nodeName&&TranslatorConstants.TerminalElements[n.nodeName.toLowerCase()])return!0;if(n.nodeType!=1||n._mstChunk||DomUtils.getStyleValue(n,"display").toLowerCase()!="inline"||DomUtils.getStyleValue(n,"position").toLowerCase()!="static")return!1;for(var t=0;t<n.childNodes.length;++t)if(!s(n.childNodes[t]))return!1;return!0}function it(n){return n.nodeName&&TranslatorConstants.OnlyAttributesTranslatableElement[n.nodeName.toLowerCase()]}function h(n){return Microsoft.JS.TextLanguage.isRtl(n)?{direction:"rtl",textAlign:"right"}:{direction:"ltr",textAlign:"left"}}function c(n){var i,t;for(n=n.replace(v,""),i=0,t=0;t<n.length;++t)i+=n.charCodeAt(t)*13*(t+7);return i}function rt(n,t,i){for(var r=c(n);t[r];)r=r+1;return t[r]=i,r}function l(n,i,r=1){var f,e,u,s,o;if(r>TranslatorConstants.MaxDepthToCheck)return"";for(f=[],e=0,u=0;u<n.childNodes.length;++u)switch(n.childNodes[u].nodeType){case 1:s=i+r.toString()+e.toString();try{o=t(n.childNodes[u])}catch(h){}o==TranslatorConstants.TranslateMode.Skip&&n.childNodes[u].previousSibling&&n.childNodes[u].previousSibling.nodeType==1?n.childNodes[u].previousSibling._mstSkipNext=e:o==TranslatorConstants.TranslateMode.Skip&&n.childNodes[u].nextSibling&&n.childNodes[u].nextSibling.nodeType==1?n.childNodes[u].nextSibling._mstSkipPrev=e:(f.push("<"),f.push(s),f.push(">"),o!=TranslatorConstants.TranslateMode.Skip&&f.push(l(n.childNodes[u],i,r+1)),f.push("<\/"),f.push(s),f.push(">"));++e;break;case 3:n.childNodes[u].nodeValue&&f.push(a(n.childNodes[u].nodeValue))}return f.join("")}function a(n){return n.replace(r,"&amp;").replace(u,"&lt;").replace(f,"&gt;").replace(y," ")}function ut(n){return n.replace(d,"").replace(k,">").replace(b,"<").replace(w,"&")}function ft(n){if(n!==null&&n!==void 0)return n.replace(g,function(n){return n.replace(r,"&amp;").replace(u,"&lt;").replace(f,"&gt;")})}function et(n){return n.replace(p,"<$1$2$3>")}function ot(n,t){return Microsoft.JS.TextLanguage.isRtl(n)===Microsoft.JS.TextLanguage.isRtl(t)?null:h(t)}function st(n,t){var i,u,r;if(!n||!n.children)return!1;for(i=[0],u=0;i.length>0&&n;){if(i.length>=t)return!0;if(r=i.length-1,!n.children||i[r]>=n.children.length){if(i.pop(),i.length===0)break;n=n.parentNode}else{if(IframeUtils.isFrame(n.children[i[r]])||e(n.children[i[r]]).length>0)return!0;n=n.children[i[r]];i[r]=i[r]+1;i.push(0);u=Math.max(u,i.length)}}return n?o(n.textContent):!1}function i(n){var r,t;if(n.nodeName.toLowerCase()=="frame"||n.nodeName.toLowerCase()=="iframe")try{i(n.contentWindow.document.documentElement)}catch(u){}else{if(n._mstStyle)for(r in n._mstStyle)try{n.style[r]=n._mstStyle[r]}catch(u){Logger.error(u)}if(n._mstStyle=null,n._mstSrcAttribute&&Object.keys(n._mstSrcAttribute).forEach(t=>n.setAttribute(t,n._mstSrcAttribute[t])),TranslatorConstants.MstAttributes.forEach(t=>{var i;if((i=n.removeAttribute)!==null&&i!==void 0)return i.call(n,t)}),n._mstSrcHtml&&n._mstSrcHtml.childNodes.length>0){while(n.childNodes.length>0)n.removeChild(n.lastChild);while(n._mstSrcHtml.childNodes.length>0)n.appendChild(n._mstSrcHtml.firstChild);n._mstSrcHtml=undefined;n._mstTooltip&&n._mstTooltip.detach()}else for(t=0;t<n.childNodes.length;++t)try{i(n.childNodes[t])}catch(u){Logger.error(u)}}}function ht(n,t){var u,i;let r="";for(i=n.length-2;i>=0;--i)if(i!=n.length-2&&(r+="_"),n[i].id){r+=n[i].id;break}else r+=(((u=n[i].nodeName)===null||u===void 0?void 0:u.toLowerCase())||"")+"-"+t[i].toString();return r}function ct(t,i,r){var e,u,f;try{if(i)return;if(e=!1,t&&t.hasOwnProperty("x-mst-element")&&(t=t["x-mst-element"],e=!0),!r||!t||!t.getAttribute)return;if(t.adjustAlign=t.getAttribute("adjustalign")&&t.getAttribute("adjustalign").toLowerCase()!="false",t.adjustAlign==null&&t.parentNode&&(t.adjustAlign=t.parentNode.adjustAlign),(t.adjustAlign==undefined||t.adjustAlign==null)&&(t.adjustAlign=!0),t.style&&(e||n.isTranslatable(t))&&t.adjustAlign){while(!e&&DomUtils.getStyleValue(t,"display")==="inline")t=t.parentNode;for(u in r)try{if(f=DomUtils.getStyleValue(t,u),f!=r[u]){if(u=="textAlign"&&(f&&f.toLowerCase().indexOf("center")!=-1||t.tagName&&t.tagName.toLowerCase()=="center"))continue;t._mstStyle||(t._mstStyle={});t._mstStyle[u]=t.style&&t.style[u]?t.style[u]:f;t.style&&(t.style[u]=r[u])}}catch(o){Logger.error(o)}}}catch(s){Logger.error(s)}}const v=/[\s\xA0]/g,y=/[\s\xA0]+/g,r=/&/g,u=/</g,f=/>/g,p=/<\s*(\/)?\s*(\w+)\s*(\d*)\s*>/g,w=/&amp;/gi,b=/&lt;/gi,k=/&gt;/gi,d=/<\/?\w+>/g,g=/<(?!\/?b\d+>)[^>]*>/g;n.checkForTranslatableAttributes=e;n.isTranslatable=nt;n.getTranslateMode=t;n.isTranslatableText=o;n.getNoTranslateElements=tt;n.isTerminal=s;n.shouldOnlyTranslateAttributes=it;n.getDirStyle=h;n.hash=c;n.generateUniqueHash=rt;n.normalizeElement=l;n.normalizeText=a;n.denormalizeText=ut;n.sanitizeTranslatedText=ft;n.sanitizeHtml=et;n.getStylesToApply=ot;n.untranslate=i;n.getDomPos=ht;n.ApplyStyle=ct}(DomTranslationUtils||(DomTranslationUtils={})),function(n){function t(n){var t;return["option","optgroup"].includes((t=n===null||n===void 0?void 0:n.nodeName)===null||t===void 0?void 0:t.toLowerCase())&&(n=n.closest("select")),n}function i(i){var u,r,f,e;try{return(i=t(i),u=i.nodeType===1?i:i.parentElement,!["title"].includes(i.nodeName.toLowerCase())&&u&&(r=u.getBoundingClientRect()))?r.height===0||r.width===0?n.ElementVisibility.hidden:(f=window.innerHeight||document.documentElement.clientHeight,e=r.top>=0&&r.top<=f+1e3||r.bottom>=0&&r.bottom<=f+1e3,e?n.ElementVisibility.insideView:n.ElementVisibility.outsideView):n.ElementVisibility.insideView}catch(o){return n.ElementVisibility.insideView}}function r(t,i,r){t&n.ElementVisibility.unknown||(r[r.length-1]++,t&n.ElementVisibility.hidden&&i[i.length-1]++)}function u(n,t,i){t.top()>0&&t.top()===i.top()&&n.length>0&&n.top().setAttribute(TranslatorConstants.HiddenElementMarker,t.top().toString());var r=t.pop();t.length>0&&(t[t.length-1]+=r);r=i.pop();i.length>0&&(i[i.length-1]+=r)}function f(n){var r=!0,f=performance.now(),t,i,u;try{t=n.nodeType===1?n:n.parentElement;t&&(i=t.getBoundingClientRect())&&(i.height===0||i.width===0?(r=!0,t._mstScrolledData=!0,t._mstScrolledTime=f):(u=window.innerHeight||document.documentElement.clientHeight,r=i.top<=u||i.bottom<=u))}catch(e){}return r}function e(n,t,i,r,u){var e,s,w,c,l,y,p,a,v;if(typeof i!="function")throw Error("There was no handler assigned for processing nodes.");for(e=[{node:n,depth:0}],e.isEmpty=function(){return this.length===0},s=0,w=typeof t=="function";!e.isEmpty();){var f=e.pop(),o=f.node.getAttribute("_msthash"),h=f.node.getAttribute(TranslatorConstants.HiddenAttributeMarker),b=f.node.hasAttribute(TranslatorConstants.VisibleElementMarker);if(b){Logger.debug("Element id "+o+" should already be visible.");continue}if(f.node.setAttribute(TranslatorConstants.VisibleElementMarker,f.depth.toString()),f.node.removeAttribute(TranslatorConstants.HiddenElementMarker),h&&w&&u.hasOwnProperty(h)){for(c=u[h],l=0;l<c.attributes.length;l++)y=c.attributes[l],t(c.element,y.attribute,y.text);delete u[h];f.node.removeAttribute(TranslatorConstants.HiddenAttributeMarker);s++}if(o&&r.hasOwnProperty(o))p=r[o],i(p.element,p.stringValue),delete r[o],s++;else for(a=0;a<f.node.children.length;a++)v=f.depth+1,v>5&&Logger.debug("Element contains children deeper than threshold while marking visible. Depth: "+v),e.push({node:f.node.children[a],depth:v})}return s}n.ElementVisibility=Object.freeze({outsideView:1,insideView:2,hidden:4,cached:8,unknown:64});n.isInViewport=i;n.updateHiddenElementCount=r;n.updateParentHiddenAttribute=u;n.isScrolledContent=f;n.processHiddenNodes=e}(VisibilityUtils||(VisibilityUtils={})),function(n){var t;(function(t){"use strict";t.config={logLevel:t.LogLevel.Error,debug:!1,translatorClient:new n.JS.AjaxEdgeTranslatorClientV3("https://edge.microsoft.com/translate/auth","https://api.cognitive.microsofttranslator.com/translate")}})(t=n.JS||(n.JS={}))}(Microsoft||(Microsoft={})),function(n){function t(t,i,r,u,f,e,o,s,h,c){function hi(n){gt||(gt=DomTranslationUtils.getNoTranslateElements());for(var t=0;t<gt.length;t++)if(gt.item(t).contains(n))return!0;return!1}function or(){var n,i;(Microsoft.Translator.requestsInitiated&&(Logger.info("Took "+(performance.now()-Microsoft.Translator.translationStartTime)+" ms to translate"),Microsoft.Translator.translationStartTime=performance.now(),Microsoft.Translator.requestsInitiated=!1),si)||(si=!0,o&&ct.length&&(Microsoft.JS.orderByDomOrder(y,ct),n=y.ownerDocument.createRange(),n.setStartBefore(ct[0]),n.setEndAfter(ct[ct.length-1]),i=y.ownerDocument.defaultView.getSelection(),i.removeAllRanges(),i.addRange(n)),ti||at||typeof h!="function"||(at=!0,h(!0)),ti||typeof u!="function"||u(t))}function eu(){return{domStack:sr,properties:hr,offsetFromStart:cr,hidden:lr,elements:ar,created:0}}function ui(){var n={domStack:[],properties:[],offsetFromStart:[],hidden:[],elements:[],created:performance.now()};return n.domStack.top=n.properties.top=n.offsetFromStart.top=n.hidden.top=n.elements.top=function(){return this[this.length-1]},n}function ou(n){return VisibilityUtils.processHiddenNodes(n,(n,t,i)=>{ft+=DomUtils.getStringByteCount(i),it.push({"x-mst-element":n,"x-mst-attribute":t}),a.push(i)},(n,t)=>{ft+=DomUtils.getStringByteCount(t),it.push(n),a.push(t)},li,ai)}function su(n){return VisibilityUtils.processHiddenNodes(n,(n,t,i)=>{tt.push({"x-mst-element":n,"x-mst-attribute":t}),ot.push(i)},(n,t)=>{tt.push(n),ot.push(t)},li,ai)}function pi(n,t,i){n.domStack.push(t);n.properties.push({isRoot:!0,traverseTerminalOnly:i});n.offsetFromStart.push(0);n.hidden.push(0);n.elements.push(0);b([t],"",!0)}function hu(n){IframeUtils.getIframeNodeDepth(n)>uu||(n.contentWindow.document.body?pr(n):n.contentWindow.onload=()=>pr(n))}function pr(n){n.contentWindow.document.readyState=="completed"?wr(n):n.contentWindow.document.body.onload=()=>wr(n)}function wr(n){var t=ui();pi(t,n,!1);ut||(ut=!0,Microsoft.Translator.translationStartTime=performance.now());setTimeout(g,rt,t,TranslatorConstants.TranslationTrigger.Mutation);wi(n.contentWindow)}function cu(n){var t=new Map,i=new Map,r;ni.push(new MutationObserver(function(n){var r=!1,u;t.clear();i.clear();n.forEach(function(n){var y,h,c,l,a,u,o,s,f,e;switch(n.type){case"characterData":if(v.has(n.target)){o=v.get(n.target);o===1?v.delete(n.target):v.set(n.target,o-1);break}if(hi(n.target))break;for(s=!0,f=n.target;DomTranslationUtils.isTerminal(f);){if(f.parentNode===null||f.parentNode===undefined){s=!1;break}f=f.parentNode}if(!s){r=!0;e=n.target.nodeType===3?n.target.nodeValue:n.target.textContent;b([n.target],e);break}if(f.nodeType===1&&f.hasAttribute("_mstHash")){f.hasAttribute("_mstTextHash")&&f.getAttribute("_mstTextHash")==DomTranslationUtils.hash(f.textContent).toString()||(r=!0,e=n.target.nodeType===3?n.target.nodeValue:n.target.textContent,b([n.target],e));break}t.has(f)||i.has(f)||(r=!0,t.set(f,1));break;case"attributes":if(TranslatorConstants.VisibilityAttributes.some(function(t){return t===n.attributeName})){n.target.getAttribute&&n.target.getAttribute(TranslatorConstants.HiddenElementMarker)&&(y=VisibilityUtils.isInViewport(n.target),h=0,y&VisibilityUtils.ElementVisibility.insideView?(h=ou(n.target),h===0?Logger.debug("A previously marked hidden chunk became visible but could not be located."):ur=DomUtils.deferTask(function(){dr(ui(),TranslatorConstants.TranslationTrigger.VisibilityChange)},ru,ur)):y&VisibilityUtils.ElementVisibility.outsideView&&(h=su(n.target),h===0&&Logger.debug("A previously marked hidden chunk became un-hidden but could not be located.")));break}if(yt.has(n.target)&&(c=yt.get(n.target),l=n.attributeName,c.hasOwnProperty(l))){c[l]===1?delete c[l]:c[l]-=1;break}if(hi(n.target))break;r=!0;b([n.target],"",!0);break;case"childList":for(a=0;a<n.addedNodes.length;a++)if(u=n.addedNodes[a],u.nodeType!==1||!(u.hasAttribute("_isTranslated")||u.hasAttribute("_mstMutation"))){if(yi.has(u)){yi.delete(u);continue}if(v.has(u)){o=v.get(u);o===1?v.delete(u):v.set(u,o-1);continue}if(!hi(u)){if(DomTranslationUtils.isTerminal(u)){if(IframeUtils.isIframeElement(u)){u.hasAttribute("_mstHash")&&u.hasAttribute("_mstTextHash")&&u.getAttribute("_mstTextHash")==DomTranslationUtils.hash(u.textContent)||hu(u);continue}}else{i.has(u)||u.nodeType!==1||u.hasAttribute("_mstHash")&&u.hasAttribute("_mstTextHash")&&u.getAttribute("_mstTextHash")==DomTranslationUtils.hash(u.textContent)||(r=!0,i.set(u,1),t.has(u)&&t.delete(u));continue}for(s=!0,f=u;DomTranslationUtils.isTerminal(f);){if(f.parentNode===null||f.parentNode===undefined){s=!1;break}f=f.parentNode}if(!s){r=!0;e=u.nodeType===3?u.nodeValue:u.textContent;b([u],e);continue}if(f.nodeType===1&&f.hasAttribute("_mstHash")){if(f.nodeName.toLowerCase()==="select")continue;f.hasAttribute("_mstTextHash")&&f.getAttribute("_mstTextHash")==DomTranslationUtils.hash(f.textContent)||(r=!0,e=u.nodeType===3?u.nodeValue:u.textContent,b([u],e));continue}t.has(f)||i.has(f)||(r=!0,t.set(f,1))}}}});u=ui();Array.from(t.keys()).forEach(function(n){pi(u,n,!0)});Array.from(i.keys()).forEach(function(n){pi(u,n,!1)});r&&l.size<w&&(r=!1,ut||(ut=!0,Microsoft.Translator.translationStartTime=performance.now()),setTimeout(g,rt,u,TranslatorConstants.TranslationTrigger.Mutation))}));r=["value","placeholder","aria-label"];r=r.concat(TranslatorConstants.VisibilityAttributes);ni[ni.length-1].observe(n.body,{childList:!0,subtree:!0,attributes:!0,characterData:!0,attributeOldValue:!0,characterDataOldValue:!0,attributeFilter:r})}function wi(n){var r,i,t;if("MutationObserver"in n&&!o&&!s)for(r=n.document,cu(r),i=r.querySelectorAll("iframe"),t=0;t<i.length;t++)i[t]&&IframeUtils.isFrame(i[t])&&wi(i[t].contentWindow)}function ki(n,t,i,r){for(var u=n.domStack,f=n.properties,h=n.offsetFromStart,e=n.hidden,o=n.elements,v=function(){return DomTranslationUtils.getDomPos(u,h)},y=0,p,w,c,s,k;y<fr&&u.length>0&&(ft<nt||i.length);){if(IframeUtils.isFrame(u.top()))u.push(u.top().contentWindow.document.body),f.push({isRoot:!1,traverseTerminalOnly:f.top().traverseTerminalOnly}),h.push(0),fi(i,r,e,o),r=null,e.push(0),o.push(0);else if(u.top().firstChild&&(f.top().isRoot||!f.top().traverseTerminalOnly)&&!DomTranslationUtils.isTerminal(u.top())&&DomTranslationUtils.isTranslatable(u.top()))u.push(u.top().firstChild),f.push({isRoot:!1,traverseTerminalOnly:f.top().traverseTerminalOnly}),h.push(0),fi(i,r,e,o),r=null,e.push(0),o.push(0),DomTranslationUtils.isTerminal(u.top())||(p=b([u.top()],v,!0),VisibilityUtils.updateHiddenElementCount(p,e,o));else{while(u.length&&f.top().isRoot!==!0&&!u.top().nextSibling&&!u.top().nextElementSibling)u.pop(),f.pop(),h.pop(),fi(i,r,e,o),r=null,VisibilityUtils.updateParentHiddenAttribute(u,e,o);f.top().isRoot===!1?(u.push(u.pop().nextSibling),DomTranslationUtils.isTerminal(u.top())||(w=b([u.top()],v,!0),VisibilityUtils.updateHiddenElementCount(w,e,o))):(u.pop(),f.pop(),h.pop(),fi(i,r,e,o),r=null,VisibilityUtils.updateParentHiddenAttribute(u,e,o))}if(u.length&&(c=(u.top().nodeName||"").toLowerCase(),DomTranslationUtils.isTerminal(u.top())&&!TranslatorConstants.UntranslatableElements[c]&&c!="iframe"&&c!="frame"&&(r||(r=v()),++h[h.length-1],i.push(u.top()))),i.length===0&&IframeUtils.isIframeElement(u.top()))if(setTimeout(ki,4,n,t,i,r),vt)break;else return;u=n.domStack;f=n.properties;h=n.offsetFromStart;e=n.hidden;o=n.elements;y++}if(y==fr){ki(n,t,i,r);return}for(s=0;(ft<nt||vt)&&s<tt.length&&s<ot.length;)k=tt[s].hasOwnProperty("x-mst-attribute")?tt[s]["x-mst-element"]:tt[s],VisibilityUtils.isInViewport(k)===VisibilityUtils.ElementVisibility.insideView?(ft+=DomUtils.getStringByteCount(ot[s]),it=it.concat(tt.splice(s,1)),a=a.concat(ot.splice(s,1))):s++;if(a.length>0||ri||vt||ht.length>0)ri=!1,vt=!1,dr(n,t);else{if(oi=oi||t===TranslatorConstants.TranslationTrigger.Auto&&u.length===0,l.size>0||ht.length>0)return;ut=!1;oi&&or()}}function g(n,t){try{DomTranslationUtils.isTerminal(y)&&!er&&(er=!0,b([y],"start.terminal.node"));setTimeout(ki,2,n,t,[],null)}catch(i){Logger.error("Unknown error in traverseDom. "+i)}}function b(n,t,i=false){for(var e,l,v,w,b,h,ut,r,g,nt,p,c,et,f=VisibilityUtils.ElementVisibility.unknown,st=typeof t=="string"?t:null,u=0;u<n.length;u++)for(e=DomTranslationUtils.checkForTranslatableAttributes(n[u]),l=null,e.length>0&&(f=VisibilityUtils.isInViewport(n[u]),f&VisibilityUtils.ElementVisibility.hidden&&(v=null,w=null,typeof t=="function"?(b=t(),b&&(v="a"+u+b)):typeof t=="string"&&t&&(v="a"+u+t),l={element:n[u],attributes:[]},v&&(w=DomTranslationUtils.generateUniqueHash(v,ai,l)),n[u].setAttribute(TranslatorConstants.HiddenElementMarker,"A"),n[u].setAttribute(TranslatorConstants.HiddenAttributeMarker,w))),h=0;h<e.length;h++){var y=DomTranslationUtils.normalizeText(n[u].getAttribute(e[h])),rt=DomTranslationUtils.hash(y),d="_mst"+e[h];if(n[u].hasAttribute(d)&&n[u].getAttribute(d)==rt)continue;else n[u].setAttribute(d,rt);ut=DomUtils.getStringByteCount(y);l?l.attributes.push({attribute:e[h],text:y}):f&VisibilityUtils.ElementVisibility.outsideView||f&VisibilityUtils.ElementVisibility.unknown?(tt.push({"x-mst-element":n[u],"x-mst-attribute":e[h]}),ot.push(y)):(ft+=ut,it.push({"x-mst-element":n[u],"x-mst-attribute":e[h]}),a.push(y));ri=!0}return i?f:n[0]&&n[0].parentNode&&n[0].parentNode.nodeType===1&&n[0].parentNode.hasAttribute("_mstTextHash")&&n[0].parentNode.getAttribute("_mstTextHash")==DomTranslationUtils.hash(n[0].parentNode.textContent)?(n.length=0,f):(au(n),n.length===0)?f:(r=lu(n),DomTranslationUtils.shouldOnlyTranslateAttributes(r))?f:(g=r.textContent,nt=DomTranslationUtils.hash(g),r.hasAttribute("_mstTextHash")&&r.getAttribute("_mstTextHash")==nt)?f:(p=null,r&&DomTranslationUtils.isTranslatable(r)&&(r.hasAttribute("_mstHash")?p=r.getAttribute("_mstHash"):(p=DomTranslationUtils.generateUniqueHash(st,k,r),r.setAttribute("_mstHash",p)),c=DomTranslationUtils.normalizeElement(r,"b"),DomTranslationUtils.isTranslatableText(c)&&(et=DomUtils.getStringByteCount(c),String.isNullOrWhiteSpace(g)||r.setAttribute("_mstTextHash",nt),f=VisibilityUtils.isInViewport(r),o||s||f&VisibilityUtils.ElementVisibility.insideView?(ft+=et,it.push(r),a.push(c)):f&VisibilityUtils.ElementVisibility.hidden?(r.setAttribute(TranslatorConstants.HiddenElementMarker,"1"),li[p]={element:r,stringValue:c}):(tt.push(r),ot.push(c)),ri=!0,o&&ct.push(r))),f)}function fi(n,t,i,r){if(n.length)try{var u=b(n,t);VisibilityUtils.updateHiddenElementCount(u,i,r)}catch(f){Logger.error(f)}}function lu(n){var t=null;if(n.length>0)if(n.length==1&&n[0].nodeType==1)t=n.pop();else if(n[0].parentNode&&n.length==n[0].parentNode.childNodes.length)t=n.pop().parentNode,n.length=0;else for(t=n[0].ownerDocument.createElement("font"),t.setAttribute("_mstMutation",1),t._mstChunk=!0,n[0].parentNode&&n[0].parentNode.insertBefore(t,n[0]);n.length>0;)n[0].nodeType===1&&n[0].setAttribute("_mstMutation",1),n[0].nodeType===3&&yi.set(n[0],1),t.appendChild(n.shift());return t}function au(n){for(var t=!0,r,i;t;){if(t=!1,n.length==1&&!DomTranslationUtils.isTranslatable(n[0]))return;if(n.length==1&&n[0].nodeType==1&&!DomTranslationUtils.isTerminal(n[0])&&n[0].childNodes.length>0){for(r=n.pop(),i=0;i<r.childNodes.length;i++)n.push(r.childNodes[i]);t=!0}n.length>0&&(di(n[0])?(n.shift(),t=!0):di(n[n.length-1])&&(n.pop(),t=!0))}n.length==1&&di(n[0])&&n.pop()}function di(n){if(o)if(n.nodeType!==3||y.ownerDocument.defaultView.getSelection().containsNode(n,!1)){if(n.nodeType===1&&!y.ownerDocument.defaultView.getSelection().containsNode(n,!0))return!0}else return!0;var t="";switch(n.nodeType){case 1:t=n.textContent||"";break;case 3:t=n.nodeValue||"";break;default:return!0}return!DomTranslationUtils.isTranslatableText(t)}function br(n,t,i,u){var a,h,y,s,f,b,e,p;if(n&&t&&typeof i=="string"&&typeof u=="number"&&!(u>TranslatorConstants.MaxDepthToCheck)){var c=0,l=[],w=[];for(a=0;a<n.childNodes.length;a++)h=n.childNodes[a],h.nodeType===1?l.push(h):h.nodeType===3&&w.push(h);for(y=0;y<t.childNodes.length;y++){if(s=t.childNodes[y],f=null,s.nodeType===3)w.length>0?(f=w.shift(),p=v.has(f)?v.get(f)+1:1,v.set(f,p),f.nodeValue=s.nodeValue):f=document.createTextNode(s.nodeValue),o&&k.detectedLanguage&&Microsoft.JS.TextLanguage.isRtl(k.detectedanguage)!==Microsoft.JS.TextLanguage.isRtl(r)&&(b=Microsoft.JS.TextLanguage.isRtl(r)?String.fromCodePoint(8207):String.fromCodePoint(8206),f.nodeValue=b+f.nodeValue+b);else if(s.nodeType===1)if(e=s.nodeName,e.length<i.length+2||e.substring(0,i.length)!==i)Logger.error("Encountered an unexpected node in the returned translated HTML. Expected "+i+u+"X but got "+e);else{var d=i.length,nt=parseInt(e.substring(d,d+1)),g=parseInt(e.substring(d+1));nt!==u?Logger.error("Encountered a node at the wrong level. Expected level "+u+" but got "+e):g>=0&&g<l.length?(f=l[g],f.hasAttribute("_isTranslated")||f.setAttribute("_isTranslated",1),br(f,s,i,u+1)):Logger.error("Encountered a node at with an invalid element index. There are "+l.length+" nodes at level "+u+" but got "+e)}f&&(n.childNodes[c]!==f&&(f.nodeType===3&&(p=v.has(f)?v.get(f)+1:1,v.set(f,p)),n.insertBefore(f,n.childNodes[c])),c++)}while(c<n.childNodes.length)n.removeChild(n.lastChild)}}function kr(n,t,i){if(n&&n.childNodes&&typeof t=="string"&&t.length!==0&&typeof i=="string"&&i.length!==0){i=i.toUpperCase();var r=document.createElement("div");r.innerHTML=DomTranslationUtils.sanitizeHtml(t);br(n,r,i,1)}}function dr(n,t){var s=[],r=[],i=0,o,u,f,e,v,h;if(ht.length>0&&!st&&(st=!0,ht.length!==0)){for(o=ht.shift(),p=o.txt,i=o.length,vr=o.dom,yr=t,u=p[0],f=Math.floor(u.length*nt/i),p=[u.substr(0,f),u];DomUtils.getStringByteCount(p[0])>nt&&f>400;)f=Math.floor(f/2),p=[u.substr(0,f),u];et={aTxt:[],aSrcSnt:[],aTgtSnt:[]};Microsoft.JS.config.translatorClient.translateAsync(wt,bt,[p[0]],null,lt,null,c).then(function(t){gr(n,t)},function(t){pt(n,t)});return}e=DomUtils.getStringByteCount(a[0]);do{if(a.length===0)break;ft-=e;vi.hasOwnProperty(a[0])?(v=it.shift(),h=a.shift(),ei(v,h,vi[h])):(i+=e,s.push(it.shift()),r.push(a.shift()));e=a.length>0?DomUtils.getStringByteCount(a[0]):0}while(it.length>0&&i<nt&&i+e+(r.length+1)*DomUtils.getStringByteCount('"",')<=ci&&r.length<fu);i>ci?(ht.push({dom:s,txt:r,length:i}),g(n,t)):i>0?(ir[d]=function(t){return function(i){vu(n,i,t)}}(d),rr[d]=function(t){return function(i){pt(n,i,t)}}(d),l[d]={Dom:s,Txt:r,Trigger:t},l.size++,Microsoft.JS.config.translatorClient.translateAsync(wt,bt,r,null,lt,null,c).then(ir[d],rr[d]),d++,yu(),l.size<w&&setTimeout(g,rt,n,t)):l.size<w&&setTimeout(g,rt,n,t)}function gr(n,t){var h,i,s;if(!ii&&st){st=!1;nu(t);var a=DomTranslationUtils.sanitizeTranslatedText(t[0].TranslatedText),u=t[0].OriginalTextSentenceLengths,e=t[0].TranslatedTextSentenceLengths,v=0,y=0;if(!(a&&u&&e)){st=!0;pt(n,t[0].Error);return}for(h=yr,Microsoft.Translator.requestsInitiated=!0,i=0;i<(p.length>1?Math.max(u.length-2,1):u.length);++i)et.aTxt.push(a.substr(y,e[i])),et.aSrcSnt.push(u[i]),et.aTgtSnt.push(e[i]),v+=u[i],y+=e[i];if(p.length>1)if(u.length<1)g(n,h);else{var r=p[1].substr(v),b=DomUtils.getStringByteCount(r),f=Math.floor(r.length*nt/b);for(p=f>nt?[r.substr(0,f),r]:[r];DomUtils.getStringByteCount(p[0])>nt&&f>400;)f=Math.floor(f/2),p=[r.substr(0,f),r];if(st)return;st=!0;Microsoft.JS.config.translatorClient.translateAsync(wt,bt,[p[0]],null,lt,null,c).then(function(t){gr(n,t)},function(t){pt(n,t)})}else{s=vr.shift();DomTranslationUtils.ApplyStyle(s,o,kt);try{ei(s,DomTranslationUtils.normalizeElement(s,"b"),et.aTxt.join(""),et.aSrcSnt,et.aTgtSnt)}catch(k){}l.size<w&&setTimeout(g,rt,n,h)}}}function nu(n){var t,i;if(typeOf(n)==="array")for(t=0;t<n.length;t++)String.isNullOrWhiteSpace(n[t].From)||(i=n[t].From.toLowerCase(),k.detectedLanguages[i]=(k.detectedLanguages[i]||0)+1,(String.isNullOrWhiteSpace(k.detectedLanguage)||k.detectedLanguages[i]>k.detectedLanguages[k.detectedLanguage])&&(k.detectedLanguage=i))}function vu(n,i,r){var a,e,f;if(!ii){if(l[r]&&i.length!==l[r].Dom.length){pt(n,"Inconsistent Data",r);return}try{if(a=l[r]&&typeof l[r].Trigger=="number"?l[r].Trigger:null,Microsoft.Translator.requestsInitiated=!0,nu(i),kt)for(e=0;e<l[r].Dom.length;e++)DomTranslationUtils.ApplyStyle(l[r].Dom[e],o,kt);f="";for(var c=l[r].Dom.pop(),v=l[r].Txt.pop(),u=i.pop();c&&u;c=l[r].Dom.pop(),v=l[r].Txt.pop(),u=i.pop()){u.Alignment&&(f.length!=0&&(f+="|"),f+=u.Alignment);try{u.TranslatedText=DomTranslationUtils.sanitizeTranslatedText(u.TranslatedText);ei(c,v,u.TranslatedText,u.OriginalTextSentenceLengths,u.TranslatedTextSentenceLengths)}catch(y){Logger.error(y)}at||s||typeof h!="function"||(VisibilityUtils.isScrolledContent(c)?nr++:nr>0&&tr++,tr>0&&(at=!0,h(!1)))}f.length!=0&&t.setAttribute("mstAlign",f);delete l[r];l.size--;l.size<w&&setTimeout(g,rt,n,a)}catch(p){Logger.error("Unknown error in translateComplete. "+p)}}}function yu(){d>iu?w=2:w>3&&d%tu==0&&(w=w-Math.floor(w/3),rt+=10)}function pt(n,t,i){typeof i=="number"&&(delete l[i],l.size--);try{if(Microsoft.Translator.requestsInitiated=!0,ti||ii)return;gi&&gi(t);ti=!0}catch(r){Logger.error("Error in translateError. "+r)}si||at||bi()}var k=this,wt=i,bt=r,y=t,lt=e,gi=function(n){if(typeof f=="function")try{f(Microsoft.JS.serialize(n))}catch(t){Logger.error("Encountered exception while calling error handler",t)}},kt,et,nt,ci,bi,ei;o=o===!0;s=s===!0;var d=0,dt,gt=null,nr=0,tr=0,at=!1,oi=!1,w=4,rt=0,tu=10,iu=33;lt=lt*w;var ir=[],rr=[],l={};l.size=0;var ht=[],ni=[],ur=null,ru=5,uu=10,fr=1e4,ct=[],er=!1,ut=!1,si=!1,ti=!1;if(y.nodeType!==1)throw new Error("Invalid input type");if(i===r||!y.hasChildNodes())return or(),this;nt=3500;ci=4e3;const fu=100;var ft=0,sr=[y],hr=[{isRoot:!0,traverseTerminalOnly:!1}],cr=[0],lr=[0],ar=[0],tt=[],ot=[],vr=[],p=[],yr=TranslatorConstants.TranslationTrigger.Auto,it=[],a=[],li={},ai={},ii=!1,st=!1,vi={},vt=!1,ri=!1,yi=new Map,v=new Map,yt=new Map;return this.detectedLanguage,this.detectedLanguages={},o||s||(dt=DomUtils.scrollStop(()=>{l.size<w&&(vt=!0,ut||(ut=!0,Microsoft.Translator.translationStartTime=performance.now()),setTimeout(g,rt,ui(),TranslatorConstants.TranslationTrigger.Scrolled))})||dt),wi(n),bi=this.cancel=function(){var t=performance.now();(ni.forEach(n=>n.disconnect()),typeof dt=="function"&&DomUtils.removeScrollEvent(n,dt),y)&&(ii=!0,function(){var n=document.querySelector("head > title");n&&DomTranslationUtils.untranslate(n)}(),o?DomTranslationUtils.untranslate(document.body):DomTranslationUtils.untranslate(y),y=null,Logger.info("Took "+(performance.now()-t)+" ms to untranslate."))},this.exit=function(){bi()},sr.top=hr.top=cr.top=lr.top=ar.top=function(){return this[this.length-1]},kt=DomTranslationUtils.getStylesToApply(wt,bt),ei=this.translateElement=function(n,t,i){var u,s,e,r,o,h,l,a,f,c;if(DomUtils.getStringByteCount(t)<60&&(vi[t]=i),t!==i){if(n.hasOwnProperty("x-mst-attribute")&&(u=n["x-mst-element"],s=n["x-mst-attribute"],u._mstSrcAttribute===undefined&&(u._mstSrcAttribute={}),u._mstSrcAttribute[s]=u.getAttribute(s)),n.hasOwnProperty("x-mst-attribute")){e=n["x-mst-element"];r=n["x-mst-attribute"];yt.has(e)?(o=yt.get(e),o.hasOwnProperty(r)?o[r]+=1:o[r]=1):(h={},h[r]=1,yt.set(e,h));l=DomTranslationUtils.hash(i);a="_mst"+r;String.isNullOrWhiteSpace(i)||n["x-mst-element"].setAttribute(a,l);n["x-mst-element"].setAttribute(n["x-mst-attribute"],DomTranslationUtils.denormalizeText(i));return}if(n._mstSrcHtml=n.cloneNode(!0),n.nodeName.toLowerCase()=="option"){kr(n,i,"b");return}f=n;n=f.cloneNode(!0);try{kr(f,i,"b");c=f.textContent;String.isNullOrWhiteSpace(c)||f.setAttribute("_mstTextHash",DomTranslationUtils.hash(c))}catch(v){}}},o||function(){var n=document.querySelector("head > title");n&&b([n],"head.title")}(),ut=!0,setTimeout(g,0,eu(),TranslatorConstants.TranslationTrigger.Auto),this}n.Microsoft=n.Microsoft||{};Microsoft.Translator={translationStartTime:0,requestsInitiated:!1};n.Microsoft.DomTranslator=t}(window);(()=>{let n;(function(n){n[n.BingAPIV2=1]="BingAPIV2";n[n.AzureAPIV3=2]="AzureAPIV3";n[n.EdgeTranslateAPI=3]="EdgeTranslateAPI";n[n.TranslateTestAPI=4]="TranslateTestAPI"})(n||(n={}));var t=Number("2");switch(t){case n.BingAPIV2:Logger.debug("Using Translate V2 APIs");Microsoft.JS.config.translatorClient=new Microsoft.JS.AjaxS2STranslatorClientV2("https://www.bing.com/translator/api/","https://api.microsofttranslator-int.com/v2/ajax.svc/TranslateArray","edge_mmx","98b49ac9-8b31-4531-81e4-baff6e4757d7");break;case n.AzureAPIV3:Logger.debug("Using Translate V3 APIs");Microsoft.JS.config.translatorClient=new Microsoft.JS.AjaxEdgeTranslatorClientV3("https://edge.microsoft.com/translate/auth","https://api.cognitive.microsofttranslator.com/translate");break;case n.EdgeTranslateAPI:Logger.debug("Using Edge Translate APIs");Microsoft.JS.config.translatorClient=new Microsoft.JS.AjaxEdgeTranslatorAPIClient("https://edge.microsoft.com/translate/");break;case n.TranslateTestAPI:Logger.debug("Using Translate Test Client");Microsoft.JS.config.translatorClient=new Microsoft.JS.TranslateTestClient;break;default:Logger.debug("Incorrect translate version passed from CPP !")}})();;} catch (error) {  cr.googleTranslate.onTranslateElementError(error);};
